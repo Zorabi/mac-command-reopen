@@ -19,8 +19,22 @@ final class ActivationMonitor: ObservableObject {
         static let recentLaunchSuppressionInterval: TimeInterval = 0.9
         static let selfTriggerSuppressInterval: TimeInterval = 0.3
         static let rapidReturnSuppressionInterval: TimeInterval = 2.0
+        static let foregroundTerminationSuppressionInterval: TimeInterval = 0.75
         static let foregroundWindowPollingInterval: TimeInterval = 0.15
         static let requiredMissingWindowSamples = 2
+    }
+
+    private struct ForegroundTerminationSuppression {
+        let sourceApplication: NSRunningApplication
+        let expiresAt: Date
+    }
+
+    private struct PendingActivationHistoryUpdate {
+        let targetBundleID: String
+        let activationDate: Date
+        let previousTargetActivationDate: Date?
+        let previousTargetActivationSource: NSRunningApplication?
+        let previousFrontmostBundleID: String?
     }
 
     static let ignoredBundleIDs: Set<String> = [
@@ -89,15 +103,22 @@ final class ActivationMonitor: ObservableObject {
     private let dockClickIntentCoordinator: DockClickIntentCoordinator
     private let onExpiredReopenNeeded: @MainActor () -> Void
     private var activationObserver: NSObjectProtocol?
+    private var terminationObserver: NSObjectProtocol?
     private var foregroundWindowTimer: Timer?
+    private var lastObservedActivatedApplication: NSRunningApplication?
     private var latestForegroundApplication: NSRunningApplication?
     private var monitoredForegroundApplication: NSRunningApplication?
     private var foregroundReturnTarget: NSRunningApplication?
     private var foregroundWindowObservation = ForegroundWindowObservationState()
     private var selfTriggeredSuppressUntil: [String: Date] = [:]
     private var lastActivationDates: [String: Date] = [:]
+    private var lastActivationSources: [String: NSRunningApplication] = [:]
     private var lastFrontmostBundleID: String?
     private var pendingReopenEvaluation: DispatchWorkItem?
+    private var pendingReopenEvaluationID: UUID?
+    private var pendingReopenSourceApplication: NSRunningApplication?
+    private var pendingActivationHistoryUpdate: PendingActivationHistoryUpdate?
+    private var foregroundTerminationSuppression: ForegroundTerminationSuppression?
 
     init(notificationCenter: NotificationCenter? = nil,
          workspace: NSWorkspace = .shared,
@@ -148,6 +169,7 @@ final class ActivationMonitor: ObservableObject {
         _isFeatureEnabled = Published(initialValue: storedValue)
         _isAutomaticSwitcherReorderingEnabled = Published(initialValue: storedAutomaticSwitcherReordering)
         _userExcludedBundleIDs = Published(initialValue: initialExcluded)
+        lastObservedActivatedApplication = workspace.frontmostApplication
         latestForegroundApplication = workspace.frontmostApplication
         configureForegroundObservation(for: workspace.frontmostApplication)
         updateObservationState()
@@ -199,8 +221,29 @@ final class ActivationMonitor: ObservableObject {
 
     private func startObservingIfNeeded() {
         guard activationObserver == nil else { return }
+        lastObservedActivatedApplication = workspace.frontmostApplication
         activationObserver = notificationCenter.addObserver(
             forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard
+                let self,
+                let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            else {
+                return
+            }
+            let sourceApplication = self.lastObservedActivatedApplication
+            self.lastObservedActivatedApplication = app
+            guard self.isFeatureEnabled else { return }
+            self.handleActivation(for: app, sourceApplication: sourceApplication)
+            // Window inspection is polling-based because other apps do not
+            // publish close/minimize notifications. Keep that cost only while
+            // the observed app is actually frontmost.
+            self.updateForegroundWindowPollingState()
+        }
+        terminationObserver = notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
             object: nil,
             queue: .main
         ) { [weak self] notification in
@@ -211,11 +254,7 @@ final class ActivationMonitor: ObservableObject {
             else {
                 return
             }
-            self.handleActivation(for: app)
-            // Window inspection is polling-based because other apps do not
-            // publish close/minimize notifications. Keep that cost only while
-            // the observed app is actually frontmost.
-            self.updateForegroundWindowPollingState()
+            self.handleTermination(of: app)
         }
         AppLogger.activation.debug("Started observing activation notifications.")
     }
@@ -226,14 +265,23 @@ final class ActivationMonitor: ObservableObject {
             self.activationObserver = nil
             AppLogger.activation.debug("Stopped observing activation notifications.")
         }
+        if let terminationObserver {
+            notificationCenter.removeObserver(terminationObserver)
+            self.terminationObserver = nil
+        }
         self.selfTriggeredSuppressUntil.removeAll()
+        lastObservedActivatedApplication = nil
+        foregroundTerminationSuppression = nil
         cancelPendingReopenEvaluation()
         stopForegroundWindowPolling()
     }
 
     private static let lastExpiredNudgeDateKey = "lastExpiredPaywallNudgeDate"
 
-    private func handleActivation(for app: NSRunningApplication) {
+    private func handleActivation(
+        for app: NSRunningApplication,
+        sourceApplication: NSRunningApplication? = nil
+    ) {
         guard !isReopenSuppressedForOnboarding else {
             AppLogger.activation.debug("Ignoring external activation while onboarding owns reopen behavior.")
             return
@@ -264,8 +312,25 @@ final class ActivationMonitor: ObservableObject {
         let now = Date()
         let previousBundleID = lastFrontmostBundleID
         let previousBundleLastActivation = previousBundleID.flatMap { lastActivationDates[$0] }
+
+        if consumeForegroundTerminationSuppression(
+            for: app,
+            sourceApplication: sourceApplication,
+            now: now
+        ) {
+            AppLogger.activation.debug(
+                "Skipping reopen for \(bundleID); activation followed termination of the foreground app."
+            )
+            return
+        }
+
         defer {
             lastActivationDates[bundleID] = now
+            if let sourceApplication {
+                lastActivationSources[bundleID] = sourceApplication
+            } else {
+                lastActivationSources.removeValue(forKey: bundleID)
+            }
             lastFrontmostBundleID = bundleID
         }
 
@@ -293,20 +358,31 @@ final class ActivationMonitor: ObservableObject {
             return
         }
 
-        if Self.shouldSuppressRapidReturn(
-            previousFrontmostBundleID: previousBundleID,
-            targetBundleID: bundleID,
-            targetLastActivationDate: lastActivationDates[bundleID],
-            previousBundleLastActivationDate: previousBundleLastActivation,
-            now: now,
-            interval: Constants.rapidReturnSuppressionInterval
-        ) {
+        let previousTargetActivationSourceHasTerminated =
+            lastActivationSources[bundleID]?.isTerminated == true
+        if !previousTargetActivationSourceHasTerminated,
+           Self.shouldSuppressRapidReturn(
+               previousFrontmostBundleID: previousBundleID,
+               targetBundleID: bundleID,
+               targetLastActivationDate: lastActivationDates[bundleID],
+               previousBundleLastActivationDate: previousBundleLastActivation,
+               now: now,
+               interval: Constants.rapidReturnSuppressionInterval
+           ) {
             AppLogger.activation.debug("Skipping reopen for \(bundleID); rapid return heuristic matched.")
             return
         }
 
         scheduleReopenEvaluation(
             forBundleIdentifier: bundleID,
+            sourceApplication: sourceApplication,
+            historyUpdate: PendingActivationHistoryUpdate(
+                targetBundleID: bundleID,
+                activationDate: now,
+                previousTargetActivationDate: lastActivationDates[bundleID],
+                previousTargetActivationSource: lastActivationSources[bundleID],
+                previousFrontmostBundleID: previousBundleID
+            ),
             presentsExpiredNudge: shouldPresentExpiredNudge
         )
     }
@@ -340,6 +416,57 @@ final class ActivationMonitor: ObservableObject {
             ? previousApplication
             : Self.finderApplication(excluding: app)
         foregroundWindowObservation.reset()
+    }
+
+    private func handleTermination(of app: NSRunningApplication, now: Date = Date()) {
+        // didActivate can arrive just before didTerminate. Keep the source app
+        // on the delayed evaluation so that ordering still cancels the reopen.
+        if Self.representsSameApplication(pendingReopenSourceApplication, app) {
+            rollbackPendingActivationHistoryUpdate()
+            cancelPendingReopenEvaluation()
+            AppLogger.activation.debug(
+                "Cancelled queued reopen after source process \(app.processIdentifier) terminated."
+            )
+        }
+
+        guard Self.representsSameApplication(lastObservedActivatedApplication, app) else {
+            return
+        }
+
+        foregroundTerminationSuppression = ForegroundTerminationSuppression(
+            sourceApplication: app,
+            expiresAt: now.addingTimeInterval(Constants.foregroundTerminationSuppressionInterval)
+        )
+        cancelPendingReopenEvaluation()
+        AppLogger.activation.debug(
+            "Foreground process \(app.processIdentifier) terminated; suppressing the next automatic foreground return."
+        )
+    }
+
+    private func consumeForegroundTerminationSuppression(
+        for app: NSRunningApplication,
+        sourceApplication: NSRunningApplication?,
+        now: Date
+    ) -> Bool {
+        guard let suppression = foregroundTerminationSuppression else {
+            return false
+        }
+        guard suppression.expiresAt >= now else {
+            foregroundTerminationSuppression = nil
+            return false
+        }
+        guard Self.representsSameApplication(suppression.sourceApplication, sourceApplication) else {
+            foregroundTerminationSuppression = nil
+            return false
+        }
+        guard Self.isEligibleForegroundApplication(app) else {
+            return false
+        }
+        guard !Self.representsSameApplication(suppression.sourceApplication, app) else {
+            return false
+        }
+        foregroundTerminationSuppression = nil
+        return true
     }
 
     private func configureForegroundObservation(for application: NSRunningApplication?) {
@@ -477,13 +604,45 @@ final class ActivationMonitor: ObservableObject {
         return isEligibleForegroundApplication(app)
     }
 
+    private static func representsSameApplication(
+        _ lhs: NSRunningApplication?,
+        _ rhs: NSRunningApplication?
+    ) -> Bool {
+        guard let lhs, let rhs else { return false }
+        if lhs === rhs { return true }
+        guard lhs.processIdentifier == rhs.processIdentifier,
+              lhs.bundleIdentifier == rhs.bundleIdentifier else {
+            return false
+        }
+        if let lhsLaunchDate = lhs.launchDate,
+           let rhsLaunchDate = rhs.launchDate {
+            return lhsLaunchDate == rhsLaunchDate
+        }
+        return true
+    }
+
     private func scheduleReopenEvaluation(
         forBundleIdentifier bundleID: String,
+        sourceApplication: NSRunningApplication?,
+        historyUpdate: PendingActivationHistoryUpdate,
         presentsExpiredNudge: Bool
     ) {
         cancelPendingReopenEvaluation()
+        let evaluationID = UUID()
         let evaluation = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+            guard let self,
+                  self.pendingReopenEvaluationID == evaluationID else {
+                return
+            }
+            if sourceApplication?.isTerminated == true {
+                self.rollbackPendingActivationHistoryUpdate()
+                self.clearPendingReopenEvaluationState()
+                AppLogger.activation.debug(
+                    "Skipping reopen for \(bundleID); the activation source has terminated."
+                )
+                return
+            }
+            self.clearPendingReopenEvaluationState()
             guard self.isFeatureEnabled else {
                 AppLogger.activation.info("Reopen evaluation ignored because feature is disabled.")
                 return
@@ -497,7 +656,6 @@ final class ActivationMonitor: ObservableObject {
                 AppLogger.activation.debug("Reopen evaluation aborted; frontmost app changed.")
                 return
             }
-
             let now = Date()
             if self.shouldSuppressRecentlyLaunchedReopen(for: frontApp, now: now) {
                 return
@@ -525,6 +683,9 @@ final class ActivationMonitor: ObservableObject {
             self.reopenApplication(withBundleIdentifier: bundleID, at: now)
         }
         pendingReopenEvaluation = evaluation
+        pendingReopenEvaluationID = evaluationID
+        pendingReopenSourceApplication = sourceApplication
+        pendingActivationHistoryUpdate = historyUpdate
         DispatchQueue.main.asyncAfter(
             deadline: .now() + Constants.reopenEvaluationDelay,
             execute: evaluation
@@ -533,7 +694,33 @@ final class ActivationMonitor: ObservableObject {
 
     private func cancelPendingReopenEvaluation() {
         pendingReopenEvaluation?.cancel()
+        clearPendingReopenEvaluationState()
+    }
+
+    private func clearPendingReopenEvaluationState() {
         pendingReopenEvaluation = nil
+        pendingReopenEvaluationID = nil
+        pendingReopenSourceApplication = nil
+        pendingActivationHistoryUpdate = nil
+    }
+
+    private func rollbackPendingActivationHistoryUpdate() {
+        guard let update = pendingActivationHistoryUpdate,
+              lastFrontmostBundleID == update.targetBundleID,
+              lastActivationDates[update.targetBundleID] == update.activationDate else {
+            return
+        }
+        if let previousDate = update.previousTargetActivationDate {
+            lastActivationDates[update.targetBundleID] = previousDate
+        } else {
+            lastActivationDates.removeValue(forKey: update.targetBundleID)
+        }
+        if let previousSource = update.previousTargetActivationSource {
+            lastActivationSources[update.targetBundleID] = previousSource
+        } else {
+            lastActivationSources.removeValue(forKey: update.targetBundleID)
+        }
+        lastFrontmostBundleID = update.previousFrontmostBundleID
     }
 
     private func shouldShowExpiredNudge(now: Date = Date()) -> Bool {
